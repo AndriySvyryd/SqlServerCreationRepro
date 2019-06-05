@@ -1,21 +1,26 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.SqlClient;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace DatabaseCreationRepro
 {
-    class Program
+    static class Program
     {
-        static void Main(string[] args)
+        static async Task Main()
         {
-            for (var i = 0; i < 50; i++)
+            var tasks = new List<Task>();
+            for (var i = 0; i < 128; i++)
             {
-                CreationTest("DatabaseCreationRepro" + i);
+                tasks.Add(CreationTestAsync("DatabaseCreationRepro" + i));
             }
+
+            await Task.WhenAll(tasks);
         }
 
-        private static void CreationTest(string databaseName)
+        private static async Task CreationTestAsync(string databaseName)
         {
             var connectionString = new SqlConnectionStringBuilder()
             {
@@ -28,27 +33,31 @@ namespace DatabaseCreationRepro
 
             using (var connection = new SqlConnection(connectionString))
             {
-                if (Exists(connection))
+                if (await ExistsAsync(connection))
                 {
                     Console.WriteLine($"Database {databaseName} already exists, dropping...");
-                    Delete(connectionString);
+                    await DeleteAsync(connectionString);
                 }
                 else
                 {
                     Console.WriteLine($"Database {databaseName} doesn't exists, creating...");
-                    Create(connectionString);
+                    if (!await CreateAsync(connectionString))
+                    {
+                        return;
+                    }
+
                     SqlConnection.ClearPool(connection);
                     while (true)
                     {
-                        if (Exists(connection))
+                        if (await ExistsAsync(connection))
                         {
-                            //Console.WriteLine("Database created succesfully, dropping...");
-                            Delete(connectionString);
+                            Console.WriteLine($"Database {databaseName} created succesfully, dropping...");
+                            await DeleteAsync(connectionString);
                             return;
                         }
                         else
                         {
-                            Console.WriteLine("Database still doesn't exist, waiting");
+                            Console.WriteLine($"Database {databaseName} still doesn't exist, waiting");
                             Thread.Sleep(TimeSpan.FromSeconds(30));
                         }
                     }
@@ -56,7 +65,7 @@ namespace DatabaseCreationRepro
             }
         }
 
-        private static bool Exists(SqlConnection connection)
+        private static async Task<bool> ExistsAsync(SqlConnection connection)
         {
             while (true)
             {
@@ -66,7 +75,7 @@ namespace DatabaseCreationRepro
                     {
                         connection.Close();
                     }
-                    connection.Open();
+                    await connection.OpenAsync();
                     connection.Close();
 
                     return true;
@@ -80,56 +89,95 @@ namespace DatabaseCreationRepro
 
                     if (ShouldRetryOn(e))
                     {
-                        Console.WriteLine("Retrying on error number: " + e.Number);
-                        Thread.Sleep(TimeSpan.FromSeconds(30));
+                        Console.WriteLine("Retrying connection on error number: " + e.Number);
+                        Thread.Sleep(TimeSpan.FromSeconds(15));
                         continue;
                     }
 
-                    Console.WriteLine("Error number: " + e.Number);
-                    throw;
+                    Console.WriteLine("Unable to connect: " + e.ToString());
                 }
             }
         }
 
-        private static void Delete(string connectionString)
+        private static async Task DeleteAsync(string connectionString)
         {
             var connectionStringBuilder = new SqlConnectionStringBuilder(connectionString);
             var database = connectionStringBuilder.InitialCatalog;
             connectionStringBuilder.InitialCatalog = "master";
 
-            using (var masterConnection = new SqlConnection(connectionStringBuilder.ToString()))
+            while (true)
             {
-                masterConnection.Open();
-                using (var command = masterConnection.CreateCommand())
+                try
                 {
-                    command.CommandText = @"IF SERVERPROPERTY('EngineEdition') <> 5
+                    using (var masterConnection = new SqlConnection(connectionStringBuilder.ToString()))
+                    {
+                        masterConnection.Open();
+                        using (var command = masterConnection.CreateCommand())
+                        {
+                            command.CommandText = @"IF SERVERPROPERTY('EngineEdition') <> 5
 BEGIN
     ALTER DATABASE " + database + @" SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
 END
 DROP DATABASE " + database + ";";
-                    command.CommandTimeout = 600;
-                    command.ExecuteNonQuery();
+                            command.CommandTimeout = 600;
+                            await command.ExecuteNonQueryAsync();
+                            return;
+                        }
+                    }
+                }
+                catch (SqlException e)
+                {
+                    if (ShouldRetryOn(e))
+                    {
+                        Console.WriteLine($"Retrying {database} deletion on error number: " + e.Number);
+                        Thread.Sleep(TimeSpan.FromSeconds(15));
+                        continue;
+                    }
+
+                    Console.WriteLine($"Deleting {database} failed: " + e.ToString());
+                    return;
                 }
             }
         }
 
-        private static void Create(string connectionString)
+        private static async Task<bool> CreateAsync(string connectionString)
         {
             var connectionStringBuilder = new SqlConnectionStringBuilder(connectionString);
             var database = connectionStringBuilder.InitialCatalog;
             connectionStringBuilder.InitialCatalog = "master";
 
-            using (var masterConnection = new SqlConnection(connectionStringBuilder.ToString()))
+            while (true)
             {
-                masterConnection.Open();
-                using (var command = masterConnection.CreateCommand())
+                try
                 {
-                    command.CommandText = "CREATE DATABASE " + database + ";";
-                    command.CommandTimeout = 600;
-                    command.ExecuteNonQuery();
+                    using (var masterConnection = new SqlConnection(connectionStringBuilder.ToString()))
+                    {
+                        masterConnection.Open();
+                        using (var command = masterConnection.CreateCommand())
+                        {
+                            command.CommandText = "CREATE DATABASE " + database + ";";
+                            command.CommandTimeout = 600;
+                            await command.ExecuteNonQueryAsync();
+
+                            return true;
+                        }
+                    }
+                }
+                catch (SqlException e)
+                {
+                    if (ShouldRetryOn(e))
+                    {
+                        Console.WriteLine($"Retrying {database} creation on error number: " + e.Number);
+                        Thread.Sleep(TimeSpan.FromSeconds(15));
+                        continue;
+                    }
+
+                    Console.WriteLine($"Creating {database} failed: " + e.ToString());
+                    return false;
                 }
             }
         }
+
         public static bool ShouldRetryOn(Exception ex)
         {
             if (ex is SqlException sqlException)
